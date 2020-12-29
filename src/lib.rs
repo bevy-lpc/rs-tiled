@@ -1,6 +1,7 @@
 use base64;
 
-use std::collections::HashMap;
+use core::panic;
+use std::{collections::HashMap, fs, io::Cursor, path::PathBuf};
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Error, Read};
@@ -54,7 +55,7 @@ macro_rules! parse_tag {
                 XmlEvent::StartElement {name, attributes, ..} => {
                     if false {}
                     $(else if name.local_name == $open_tag {
-                        match $open_method(attributes) {
+                        match $open_method(&attributes) {
                             Ok(()) => {},
                             Err(e) => return Err(e)
                         };
@@ -114,6 +115,7 @@ pub enum TiledError {
     XmlDecodingError(XmlError),
     PrematureEnd(String),
     Other(String),
+    LoaderError(Error),
 }
 
 impl fmt::Display for TiledError {
@@ -125,6 +127,8 @@ impl fmt::Display for TiledError {
             TiledError::XmlDecodingError(ref e) => write!(fmt, "{}", e),
             TiledError::PrematureEnd(ref e) => write!(fmt, "{}", e),
             TiledError::Other(ref s) => write!(fmt, "{}", s),
+            TiledError::LoaderError(ref e) => write!(fmt, "{}", e),
+
         }
     }
 }
@@ -139,6 +143,7 @@ impl std::error::Error for TiledError {
             TiledError::XmlDecodingError(ref e) => Some(e as &dyn std::error::Error),
             TiledError::PrematureEnd(_) => None,
             TiledError::Other(_) => None,
+            TiledError::LoaderError(ref e) => Some(e as &dyn std::error::Error),
         }
     }
 }
@@ -188,7 +193,7 @@ pub type Properties = HashMap<String, PropertyValue>;
 fn parse_properties<R: Read>(parser: &mut EventReader<R>) -> Result<Properties, TiledError> {
     let mut p = HashMap::new();
     parse_tag!(parser, "properties", {
-        "property" => |attrs:Vec<OwnedAttribute>| {
+        "property" => |attrs:&Vec<OwnedAttribute>| {
             let (t, (k, v)) = get_attrs!(
                 attrs,
                 optionals: [
@@ -218,7 +223,7 @@ pub struct Map {
     pub height: u32,
     pub tile_width: u32,
     pub tile_height: u32,
-    pub tilesets: Vec<Tileset>,
+    pub tilesets: Vec<TilesetElement>,
     pub layers: Vec<Layer>,
     pub image_layers: Vec<ImageLayer>,
     pub object_groups: Vec<ObjectGroup>,
@@ -228,10 +233,25 @@ pub struct Map {
 }
 
 impl Map {
+   /// This function will return the correct Tileset given a GID.
+   pub fn get_tileset_by_gid(&self, gid: u32) -> Option<&TilesetElement> {
+    let mut maximum_gid: i32 = -1;
+    let mut maximum_ts = None;
+    for tileset in self.tilesets.iter() {
+        let first_gid = tileset.get_first_gid();
+        if first_gid as i32 > maximum_gid && first_gid <= gid {
+            maximum_gid = first_gid as i32;
+            maximum_ts = Some(tileset);
+        }
+    }
+    maximum_ts
+    }
+
     fn new<R: Read>(
         parser: &mut EventReader<R>,
-        attrs: Vec<OwnedAttribute>,
-        map_path: Option<&Path>,
+        attrs: &Vec<OwnedAttribute>,
+        loader: &TiledLoader,
+        map_path: Option<&Path>
     ) -> Result<Map, TiledError> {
         let ((c, infinite), (v, o, w, h, tw, th)) = get_attrs!(
             attrs,
@@ -258,7 +278,7 @@ impl Map {
         let mut layer_index = 0;
         parse_tag!(parser, "map", {
             "tileset" => | attrs| {
-                tilesets.push(Tileset::new(parser, attrs, map_path)?);
+                tilesets.push(TilesetElement::new(parser, attrs, loader, map_path)?);
                 Ok(())
             },
             "layer" => |attrs| {
@@ -297,19 +317,6 @@ impl Map {
             infinite: infinite.unwrap_or(false)
         })
     }
-
-    /// This function will return the correct Tileset given a GID.
-    pub fn get_tileset_by_gid(&self, gid: u32) -> Option<&Tileset> {
-        let mut maximum_gid: i32 = -1;
-        let mut maximum_ts = None;
-        for tileset in self.tilesets.iter() {
-            if tileset.first_gid as i32 > maximum_gid && tileset.first_gid <= gid {
-                maximum_gid = tileset.first_gid as i32;
-                maximum_ts = Some(tileset);
-            }
-        }
-        maximum_ts
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -334,11 +341,110 @@ impl FromStr for Orientation {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub enum TilesetElement {
+    Reference(TilesetReference),
+    Tileset(u32, Tileset),
+    Loaded(TilesetReference, Tileset)
+}
+
+impl TilesetElement {
+    fn new<R: Read>(
+        parser: &mut EventReader<R>,
+        attrs: &Vec<OwnedAttribute>,
+        loader: &TiledLoader,
+        map_path: Option<&Path>
+    ) -> Result<TilesetElement, TiledError> {
+        let ((source), (first_gid)) = get_attrs!(
+            attrs,
+            optionals: [
+                ("source", source, |v:String| v.parse().ok())
+            ],
+            required: [
+                ("firstgid", first_gid, |v:String| v.parse().ok()),
+                
+            ],
+            TiledError::MalformedAttributes("tileset must have a firstgid".to_string())
+        );
+
+        let element = match source {
+            Some(src) => Ok(TilesetElement::Reference(TilesetReference{ source: src, first_gid})),
+            None => Tileset::new(parser, attrs, loader, map_path).map(|tileset| { TilesetElement::Tileset(first_gid, tileset)})
+        }?;
+
+        match (element, loader.settings.load_external) {
+            (TilesetElement::Reference(reference), true) => {
+                let source = PathBuf::from(reference.clone().source);
+                let tileset_path = match map_path {
+                    Some(path) => loader.resolve_path(path, &source),
+                    _ => source
+                };
+
+                let tileset = load_tileset_impl(&tileset_path, loader)?;
+
+                Ok(TilesetElement::Loaded(reference.clone(), tileset))
+            },
+            (e, _) => Ok(e)
+        }
+    }
+
+    pub fn get_first_gid(&self) -> u32 {
+        match self {
+            TilesetElement::Reference(reference) => { reference.first_gid }
+            TilesetElement::Tileset(first_gid, _) => { *first_gid }
+            TilesetElement::Loaded(reference, _) => { reference.first_gid }
+        }
+    }
+
+    pub fn get_source(&self) -> Option<&String> {
+        match self {
+            TilesetElement::Reference(reference) => { Some(&reference.source) }
+            TilesetElement::Loaded(reference, _) => { Some(&reference.source) }
+            TilesetElement::Tileset(_, _) => None
+        }
+    }
+
+    pub fn get_tileset(&self) -> Option<&Tileset> {
+        match self {
+            TilesetElement::Tileset(_, t) => { Option::Some(t) }
+            TilesetElement::Loaded(_, t) => { Option::Some(t) }
+            TilesetElement::Reference(_) => { Option::None  }
+        }
+    }    
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct TilesetReference {
+    pub first_gid: u32,
+    pub source: String,
+}
+
+impl TilesetReference {
+    fn new(
+        attrs: &Vec<OwnedAttribute>
+    ) -> Result<TilesetReference, TiledError> {
+        let ((), (first_gid, source)) = get_attrs!(
+            attrs,
+            optionals: [],
+            required: [
+                ("firstgid", first_gid, |v:String| v.parse().ok()),
+                ("source", name, |v| Some(v)),
+            ],
+            TiledError::MalformedAttributes("tileset must have a firstgid, name tile width and height with correct types".to_string())
+        );
+
+        Ok(TilesetReference {
+            first_gid,
+            source
+        })
+    }
+}
+
 /// A tileset, usually the tilesheet image.
 #[derive(Debug, PartialEq, Clone)]
 pub struct Tileset {
     /// The GID of the first tile stored
-    pub first_gid: u32,
+    //pub first_gid: u32,
     pub name: String,
     pub tile_width: u32,
     pub tile_height: u32,
@@ -353,19 +459,23 @@ pub struct Tileset {
 }
 
 impl Tileset {
+    /*
     fn new<R: Read>(
         parser: &mut EventReader<R>,
-        attrs: Vec<OwnedAttribute>,
+        attrs: &Vec<OwnedAttribute>,
         map_path: Option<&Path>,
     ) -> Result<Tileset, TiledError> {
-        Tileset::new_internal(parser, &attrs).or_else(|_| Tileset::new_reference(&attrs, map_path))
+        Tileset::new_internal(parser, &attrs).or_else(|_| Tileset::new_resolved_reference(&attrs, map_path))
     }
+    */
 
-    fn new_internal<R: Read>(
+    fn new<R: Read>(
         parser: &mut EventReader<R>,
         attrs: &Vec<OwnedAttribute>,
+        loader: &TiledLoader,
+        tileset_path: Option<&Path>
     ) -> Result<Tileset, TiledError> {
-        let ((spacing, margin, tilecount), (first_gid, name, width, height)) = get_attrs!(
+        let ((spacing, margin, tilecount), (name, width, height)) = get_attrs!(
            attrs,
            optionals: [
                 ("spacing", spacing, |v:String| v.parse().ok()),
@@ -373,19 +483,18 @@ impl Tileset {
                 ("tilecount", tilecount, |v:String| v.parse().ok()),
             ],
            required: [
-                ("firstgid", first_gid, |v:String| v.parse().ok()),
                 ("name", name, |v| Some(v)),
                 ("tilewidth", width, |v:String| v.parse().ok()),
                 ("tileheight", height, |v:String| v.parse().ok()),
             ],
-            TiledError::MalformedAttributes("tileset must have a firstgid, name tile width and height with correct types".to_string())
+            TiledError::MalformedAttributes("tileset must have a name, tile width and height with correct types".to_string())
         );
 
         let mut images = Vec::new();
         let mut tiles = Vec::new();
         let mut properties = HashMap::new();
         parse_tag!(parser, "tileset", {
-            "image" => |attrs| {
+            "image" => |attrs:&Vec<OwnedAttribute>| {
                 images.push(Image::new(parser, attrs)?);
                 Ok(())
             },
@@ -393,7 +502,7 @@ impl Tileset {
                 properties = parse_properties(parser)?;
                 Ok(())
             },
-            "tile" => |attrs| {
+            "tile" => |attrs:&Vec<OwnedAttribute>| {
                 tiles.push(Tile::new(parser, attrs)?);
                 Ok(())
             },
@@ -404,115 +513,10 @@ impl Tileset {
             tile_height: height,
             spacing: spacing.unwrap_or(0),
             margin: margin.unwrap_or(0),
-            first_gid,
             name,
             tilecount,
             images,
             tiles,
-            properties,
-        })
-    }
-
-    fn new_reference(
-        attrs: &Vec<OwnedAttribute>,
-        map_path: Option<&Path>,
-    ) -> Result<Tileset, TiledError> {
-        let ((), (first_gid, source)) = get_attrs!(
-            attrs,
-            optionals: [],
-            required: [
-                ("firstgid", first_gid, |v:String| v.parse().ok()),
-                ("source", name, |v| Some(v)),
-            ],
-            TiledError::MalformedAttributes("tileset must have a firstgid, name tile width and height with correct types".to_string())
-        );
-
-        let tileset_path = map_path.ok_or(TiledError::Other("Maps with external tilesets must know their file location.  See parse_with_path(Path).".to_string()))?.with_file_name(source);
-        let file = File::open(&tileset_path).map_err(|_| {
-            TiledError::Other(format!(
-                "External tileset file not found: {:?}",
-                tileset_path
-            ))
-        })?;
-        Tileset::new_external(file, first_gid)
-    }
-
-    fn new_external<R: Read>(file: R, first_gid: u32) -> Result<Tileset, TiledError> {
-        let mut tileset_parser = EventReader::new(file);
-        loop {
-            match tileset_parser
-                .next()
-                .map_err(TiledError::XmlDecodingError)?
-            {
-                XmlEvent::StartElement {
-                    name, attributes, ..
-                } => {
-                    if name.local_name == "tileset" {
-                        return Tileset::parse_external_tileset(
-                            first_gid,
-                            &mut tileset_parser,
-                            &attributes,
-                        );
-                    }
-                }
-                XmlEvent::EndDocument => {
-                    return Err(TiledError::PrematureEnd(
-                        "Tileset Document ended before map was parsed".to_string(),
-                    ))
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn parse_external_tileset<R: Read>(
-        first_gid: u32,
-        parser: &mut EventReader<R>,
-        attrs: &Vec<OwnedAttribute>,
-    ) -> Result<Tileset, TiledError> {
-        let ((spacing, margin, tilecount), (name, width, height)) = get_attrs!(
-            attrs,
-            optionals: [
-                ("spacing", spacing, |v:String| v.parse().ok()),
-                ("margin", margin, |v:String| v.parse().ok()),
-                ("tilecount", tilecount, |v:String| v.parse().ok()),
-            ],
-            required: [
-                ("name", name, |v| Some(v)),
-                ("tilewidth", width, |v:String| v.parse().ok()),
-                ("tileheight", height, |v:String| v.parse().ok()),
-            ],
-            TiledError::MalformedAttributes("tileset must have a firstgid, name tile width and height with correct types".to_string())
-        );
-
-        let mut images = Vec::new();
-        let mut tiles = Vec::new();
-        let mut properties = HashMap::new();
-        parse_tag!(parser, "tileset", {
-            "image" => |attrs| {
-                images.push(Image::new(parser, attrs)?);
-                Ok(())
-            },
-            "tile" => |attrs| {
-                tiles.push(Tile::new(parser, attrs)?);
-                Ok(())
-            },
-            "properties" => |_| {
-                properties = parse_properties(parser)?;
-                Ok(())
-            },
-        });
-
-        Ok(Tileset {
-            first_gid: first_gid,
-            name: name,
-            tile_width: width,
-            tile_height: height,
-            spacing: spacing.unwrap_or(0),
-            margin: margin.unwrap_or(0),
-            tilecount: tilecount,
-            images: images,
-            tiles: tiles,
             properties,
         })
     }
@@ -532,7 +536,7 @@ pub struct Tile {
 impl Tile {
     fn new<R: Read>(
         parser: &mut EventReader<R>,
-        attrs: Vec<OwnedAttribute>,
+        attrs: &Vec<OwnedAttribute>,
     ) -> Result<Tile, TiledError> {
         let ((tile_type, probability), id) = get_attrs!(
             attrs,
@@ -551,7 +555,7 @@ impl Tile {
         let mut objectgroup = None;
         let mut animation = None;
         parse_tag!(parser, "tile", {
-            "image" => |attrs| {
+            "image" => |attrs:&Vec<OwnedAttribute>| {
                 images.push(Image::new(parser, attrs)?);
                 Ok(())
             },
@@ -559,7 +563,7 @@ impl Tile {
                 properties = parse_properties(parser)?;
                 Ok(())
             },
-            "objectgroup" => |attrs| {
+            "objectgroup" => |attrs:&Vec<OwnedAttribute>| {
                 objectgroup = Some(ObjectGroup::new(parser, attrs, None)?);
                 Ok(())
             },
@@ -592,7 +596,7 @@ pub struct Image {
 impl Image {
     fn new<R: Read>(
         parser: &mut EventReader<R>,
-        attrs: Vec<OwnedAttribute>,
+        attrs: &Vec<OwnedAttribute>,
     ) -> Result<Image, TiledError> {
         let (c, (s, w, h)) = get_attrs!(
             attrs,
@@ -665,7 +669,7 @@ pub struct Layer {
 impl Layer {
     fn new<R: Read>(
         parser: &mut EventReader<R>,
-        attrs: Vec<OwnedAttribute>,
+        attrs: &Vec<OwnedAttribute>,
         width: u32,
         layer_index: u32,
         infinite: bool,
@@ -727,7 +731,7 @@ pub struct Chunk {
 impl Chunk {
     pub(crate) fn new<R: Read>(
         parser: &mut EventReader<R>,
-        attrs: Vec<OwnedAttribute>,    
+        attrs: &Vec<OwnedAttribute>,    
         encoding: Option<String>,
         compression: Option<String>,
     ) -> Result<Chunk, TiledError> {
@@ -773,7 +777,7 @@ pub struct ImageLayer {
 impl ImageLayer {
     fn new<R: Read>(
         parser: &mut EventReader<R>,
-        attrs: Vec<OwnedAttribute>,
+        attrs: &Vec<OwnedAttribute>,
         layer_index: u32,
     ) -> Result<ImageLayer, TiledError> {
         let ((o, v, ox, oy), n) = get_attrs!(
@@ -830,7 +834,7 @@ pub struct ObjectGroup {
 impl ObjectGroup {
     fn new<R: Read>(
         parser: &mut EventReader<R>,
-        attrs: Vec<OwnedAttribute>,
+        attrs: &Vec<OwnedAttribute>,
         layer_index: Option<u32>,
     ) -> Result<ObjectGroup, TiledError> {
         let ((o, v, c, n), ()) = get_attrs!(
@@ -847,7 +851,7 @@ impl ObjectGroup {
         let mut objects = Vec::new();
         let mut properties = HashMap::new();
         parse_tag!(parser, "objectgroup", {
-            "object" => |attrs| {
+            "object" => |attrs:&Vec<OwnedAttribute>| {
                 objects.push(Object::new(parser, attrs)?);
                 Ok(())
             },
@@ -896,7 +900,7 @@ pub struct Object {
 impl Object {
     fn new<R: Read>(
         parser: &mut EventReader<R>,
-        attrs: Vec<OwnedAttribute>,
+        attrs: &Vec<OwnedAttribute>,
     ) -> Result<Object, TiledError> {
         let ((id, gid, n, t, w, h, v, r), (x, y)) = get_attrs!(
             attrs,
@@ -974,7 +978,7 @@ impl Object {
         })
     }
 
-    fn new_polyline(attrs: Vec<OwnedAttribute>) -> Result<ObjectShape, TiledError> {
+    fn new_polyline(attrs: &Vec<OwnedAttribute>) -> Result<ObjectShape, TiledError> {
         let ((), s) = get_attrs!(
             attrs,
             optionals: [],
@@ -987,7 +991,7 @@ impl Object {
         Ok(ObjectShape::Polyline { points: points })
     }
 
-    fn new_polygon(attrs: Vec<OwnedAttribute>) -> Result<ObjectShape, TiledError> {
+    fn new_polygon(attrs: &Vec<OwnedAttribute>) -> Result<ObjectShape, TiledError> {
         let ((), s) = get_attrs!(
             attrs,
             optionals: [],
@@ -1033,7 +1037,7 @@ pub struct Frame {
 }
 
 impl Frame {
-    fn new(attrs: Vec<OwnedAttribute>) -> Result<Frame, TiledError> {
+    fn new(attrs: &Vec<OwnedAttribute>) -> Result<Frame, TiledError> {
         let ((), (tile_id, duration)) = get_attrs!(
             attrs,
             optionals: [],
@@ -1063,7 +1067,7 @@ fn parse_animation<R: Read>(parser: &mut EventReader<R>) -> Result<Vec<Frame>, T
 
 fn parse_infinite_data<R: Read>(
     parser: &mut EventReader<R>,
-    attrs: Vec<OwnedAttribute>,
+    attrs: &Vec<OwnedAttribute>,
     width: u32,
 ) -> Result<LayerData, TiledError> {
     let ((e, c), ()) = get_attrs!(
@@ -1090,7 +1094,7 @@ fn parse_infinite_data<R: Read>(
 
 fn parse_data<R: Read>(
     parser: &mut EventReader<R>,
-    attrs: Vec<OwnedAttribute>,
+    attrs: &Vec<OwnedAttribute>,
     width: u32,
 ) -> Result<LayerData, TiledError> {
     let ((e, c), ()) = get_attrs!(
@@ -1246,15 +1250,18 @@ fn convert_to_tile(all: &Vec<u8>, width: u32) -> Vec<Vec<LayerTile>> {
     data
 }
 
-fn parse_impl<R: Read>(reader: R, map_path: Option<&Path>) -> Result<Map, TiledError> {
+
+type CreateElement<R: Read, E> = fn (&mut EventReader<R>, &Vec<OwnedAttribute>, &TiledLoader, Option<&Path>) -> Result<E, TiledError>;
+
+fn parse_impl<R: Read, E>(reader: R, loader: &TiledLoader, path: Option<&Path>, local_name: &str, create: CreateElement<R, E>) -> Result<E, TiledError> {
     let mut parser = EventReader::new(reader);
     loop {
         match parser.next().map_err(TiledError::XmlDecodingError)? {
             XmlEvent::StartElement {
                 name, attributes, ..
             } => {
-                if name.local_name == "map" {
-                    return Map::new(&mut parser, attributes, map_path);
+                if name.local_name == local_name {
+                    return create(&mut parser, &attributes, loader, path);
                 }
             }
             XmlEvent::EndDocument => {
@@ -1267,27 +1274,147 @@ fn parse_impl<R: Read>(reader: R, map_path: Option<&Path>) -> Result<Map, TiledE
     }
 }
 
+fn parse_map_impl<R: Read>(reader: R, loader: &TiledLoader, map_path: Option<&Path>) -> Result<Map, TiledError> {
+    parse_impl(reader, loader, map_path, "map", Map::new)
+}
+
+fn parse_tileset_impl<R: Read>(reader: R, loader: &TiledLoader, tileset_path: Option<&Path>) -> Result<Tileset, TiledError> {
+    parse_impl(reader, loader, tileset_path, "tileset", Tileset::new)
+}
+
+fn load_map_impl(path: &Path, loader: &TiledLoader) -> Result<Map, TiledError> {
+    let bytes = loader.read_bytes(path)?;
+    let reader = Cursor::new(bytes);
+    parse_map_impl(reader, loader, Some(path))
+}
+
+fn load_tileset_impl(path: &Path, loader: &TiledLoader) -> Result<Tileset, TiledError> {
+    let bytes = loader.read_bytes(path)?;
+    let reader = Cursor::new(bytes);
+    parse_tileset_impl(reader, loader, Some(path))
+}
+
+/*
+fn resolve_tileset(element: TilesetElement,  map_path: &Path) -> Result<TilesetElement, TiledError> {
+    let reference  = match element {
+        TilesetElement::Reference(reference) => reference,
+        _ => return Ok(element),
+    };
+    let tileset_path = map_path.with_file_name(reference.source.clone());
+    let tileset_file = File::open(tileset_path)
+    .map_err(|_| TiledError::Other(format!("Tileset file not found: {:?}", reference.source.clone())))?;
+    let tileset = Tileset::new_external(tileset_file)?;
+
+    Ok(TilesetElement::Loaded(reference, tileset))
+}
+*/
+/*
+fn resolve_tilesets(mut map: Map, map_path: &Path) -> Result<Map, TiledError> {
+
+    for ele in & mut map.tilesets {
+        let resolved = resolve_tileset(ele, map_path);
+    }
+    map.tilesets.into_iter().map(|t|  { resolve_tileset(t, map_path) }).clone_into(map.tilesets);
+
+    
+}
+*/
+trait TiledIOHandler {
+    fn read_bytes<'a>(&self, path: &'a Path) -> Result<Vec<u8>, Error>;
+    fn resolve_path<'a, 'b>(&self, base: &'a Path, path: &'a Path) -> PathBuf;
+}
+
+struct TiledFSHandler {}
+
+impl TiledIOHandler for TiledFSHandler {
+    fn read_bytes<'a>(&self, path: &'a Path) -> Result<Vec<u8>, Error> {
+        let mut file = File::open(path)?;
+        let metadata = fs::metadata(&path).expect("unable to read metadata");
+        let mut buffer = vec![0; metadata.len() as usize];
+        file.read(&mut buffer).expect("buffer overflow");
+
+        Ok(buffer)
+    }
+
+    fn resolve_path<'a, 'b>(&self, base: &'a Path, path: &'b Path) -> PathBuf {
+        let result = base.parent().unwrap().join(path);
+        println!("resolve({:?}, {:?}) -> {:?}",base, path, result);
+        result
+
+    }
+    
+}
+
+
+
+struct TiledLoader {
+    settings: TiledSettings,
+    io: Box<dyn TiledIOHandler>,
+}
+
+impl TiledLoader {
+    fn default() -> TiledLoader {
+        TiledLoader {
+            settings: TiledSettings::default(),
+            io: Box::new(TiledFSHandler{})
+        }
+    }
+
+    fn read_bytes<'a>(&self, path: &'a Path) -> Result<Vec<u8>, TiledError> {
+        self.io.read_bytes(path).map_err(TiledError::LoaderError)
+    }
+
+    fn resolve_path<'a, 'b>(&self, base: &'a Path, path: &'b Path) -> PathBuf {
+        self.io.resolve_path(base, path)
+    }
+}
+
+struct TiledSettings {
+    load_external: bool,
+    resolve_paths: bool
+}
+
+impl TiledSettings {
+    pub fn default() -> TiledSettings {
+        TiledSettings{
+            load_external: true,
+            resolve_paths: true
+        }
+    }
+}
+/*
+struct TiledParser {
+    loader: TiledLoader
+}
+
+impl TiledParser {
+    pub fn default() -> TiledParser {
+        TiledParser{
+            loader: TiledLoader::default(),
+        }
+    }
+}
+*/
+
 /// Parse a buffer hopefully containing the contents of a Tiled file and try to
 /// parse it. This augments `parse` with a file location: some engines
 /// (e.g. Amethyst) simply hand over a byte stream (and file location) for parsing,
 /// in which case this function may be required.
 pub fn parse_with_path<R: Read>(reader: R, path: &Path) -> Result<Map, TiledError> {
-    parse_impl(reader, Some(path))
+    parse_map_impl(reader, &TiledLoader::default(), Some(path))
 }
 
 /// Parse a file hopefully containing a Tiled map and try to parse it.  If the
 /// file has an external tileset, the tileset file will be loaded using a path
 /// relative to the map file's path.
 pub fn parse_file(path: &Path) -> Result<Map, TiledError> {
-    let file = File::open(path)
-        .map_err(|_| TiledError::Other(format!("Map file not found: {:?}", path)))?;
-    parse_impl(file, Some(path))
+    load_map_impl(path, &TiledLoader::default())
 }
 
 /// Parse a buffer hopefully containing the contents of a Tiled file and try to
 /// parse it.
 pub fn parse<R: Read>(reader: R) -> Result<Map, TiledError> {
-    parse_impl(reader, None)
+    parse_map_impl(reader, &TiledLoader::default(), None)
 }
 
 /// Parse a buffer hopefully containing the contents of a Tiled tileset.
@@ -1295,6 +1422,6 @@ pub fn parse<R: Read>(reader: R) -> Result<Map, TiledError> {
 /// External tilesets do not have a firstgid attribute.  That lives in the
 /// map. You must pass in `first_gid`.  If you do not need to use gids for anything,
 /// passing in 1 will work fine.
-pub fn parse_tileset<R: Read>(reader: R, first_gid: u32) -> Result<Tileset, TiledError> {
-    Tileset::new_external(reader, first_gid)
+pub fn parse_tileset<R: Read>(reader: R) -> Result<Tileset, TiledError> {
+    parse_tileset_impl(reader, &TiledLoader::default(), None)
 }
