@@ -495,7 +495,7 @@ impl Tileset {
         let mut properties = HashMap::new();
         parse_tag!(parser, "tileset", {
             "image" => |attrs:&Vec<OwnedAttribute>| {
-                images.push(Image::new(parser, attrs)?);
+                images.push(Image::new_with_path(parser, attrs, loader, tileset_path)?);
                 Ok(())
             },
             "properties" => |_| {
@@ -503,7 +503,7 @@ impl Tileset {
                 Ok(())
             },
             "tile" => |attrs:&Vec<OwnedAttribute>| {
-                tiles.push(Tile::new(parser, attrs)?);
+                tiles.push(Tile::new(parser, attrs, loader, tileset_path)?);
                 Ok(())
             },
         });
@@ -537,6 +537,8 @@ impl Tile {
     fn new<R: Read>(
         parser: &mut EventReader<R>,
         attrs: &Vec<OwnedAttribute>,
+        loader: &TiledLoader,
+        tileset_path: Option<&Path>
     ) -> Result<Tile, TiledError> {
         let ((tile_type, probability), id) = get_attrs!(
             attrs,
@@ -556,7 +558,7 @@ impl Tile {
         let mut animation = None;
         parse_tag!(parser, "tile", {
             "image" => |attrs:&Vec<OwnedAttribute>| {
-                images.push(Image::new(parser, attrs)?);
+                images.push(Image::new_with_path(parser, attrs, loader, tileset_path)?);
                 Ok(())
             },
             "properties" => |_| {
@@ -594,6 +596,31 @@ pub struct Image {
 }
 
 impl Image {
+    fn new_with_path<R: Read>(
+        parser: &mut EventReader<R>,
+        attrs: &Vec<OwnedAttribute>,
+        loader: &TiledLoader,
+        parent_path: Option<&Path>
+    ) -> Result<Image, TiledError> {
+        let mut image = Self::new(parser, attrs)?;
+
+        match (parent_path, loader.settings.resolve_paths) {
+            (Some(path), true) => {
+                let source_path = Path::new(&image.source);
+                let resolved_path = loader
+                    .resolve_path(path, source_path)
+                    .into_os_string()
+                    .into_string()
+                    .unwrap();
+
+                image.source = resolved_path;
+                Ok(image)
+            }
+            _ => Ok(image)
+        }
+        //return image;
+    }
+
     fn new<R: Read>(
         parser: &mut EventReader<R>,
         attrs: &Vec<OwnedAttribute>,
@@ -1319,12 +1346,12 @@ fn resolve_tilesets(mut map: Map, map_path: &Path) -> Result<Map, TiledError> {
     
 }
 */
-trait TiledIOHandler {
+pub trait TiledIOHandler {
     fn read_bytes<'a>(&self, path: &'a Path) -> Result<Vec<u8>, Error>;
     fn resolve_path<'a, 'b>(&self, base: &'a Path, path: &'a Path) -> PathBuf;
 }
 
-struct TiledFSHandler {}
+pub struct TiledFSHandler {}
 
 impl TiledIOHandler for TiledFSHandler {
     fn read_bytes<'a>(&self, path: &'a Path) -> Result<Vec<u8>, Error> {
@@ -1349,14 +1376,14 @@ impl TiledIOHandler for TiledFSHandler {
 
 struct TiledLoader {
     settings: TiledSettings,
-    io: Box<dyn TiledIOHandler>,
+    io: std::sync::Arc<dyn TiledIOHandler + Sync +Send>,
 }
 
 impl TiledLoader {
     fn default() -> TiledLoader {
         TiledLoader {
             settings: TiledSettings::default(),
-            io: Box::new(TiledFSHandler{})
+            io: std::sync::Arc::new(TiledFSHandler{})
         }
     }
 
@@ -1382,8 +1409,8 @@ impl TiledSettings {
         }
     }
 }
-/*
-struct TiledParser {
+
+pub struct TiledParser {
     loader: TiledLoader
 }
 
@@ -1393,8 +1420,25 @@ impl TiledParser {
             loader: TiledLoader::default(),
         }
     }
+
+    pub fn new(io: std::sync::Arc<dyn TiledIOHandler + Sync  + Send>) -> TiledParser {
+        TiledParser {
+            loader: TiledLoader {
+                settings: TiledSettings::default(),
+                io
+            }
+        }
+    }
+
+    pub fn parse_map<R: Read>(&self,reader: R, map_path: Option<&Path>) -> Result<Map, TiledError> {
+        parse_map_impl(reader, &self.loader, map_path)
+    }
+
+    pub fn load_map(&self, map_path: &Path)-> Result<Map, TiledError> {
+        load_map_impl(map_path, &self.loader)
+    }
 }
-*/
+
 
 /// Parse a buffer hopefully containing the contents of a Tiled file and try to
 /// parse it. This augments `parse` with a file location: some engines
